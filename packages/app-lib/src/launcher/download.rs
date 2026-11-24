@@ -29,6 +29,7 @@ use minecraft_meta_manifest::{
 };
 use reqwest::Method;
 use std::{
+    collections::BTreeSet,
     future::Future,
     pin::Pin,
     sync::{
@@ -224,6 +225,47 @@ fn should_download(path_exists: bool, force: bool) -> bool {
     !path_exists || force
 }
 
+pub(super) fn native_fingerprint_path(
+    st: &State,
+    version: &str,
+) -> std::path::PathBuf {
+    st.directories.version_natives_dir(version).join(".native-fingerprint")
+}
+
+/// Fingerprints the native library artifacts applicable to this platform.
+fn expected_native_fingerprint(
+    libraries: &[Library],
+    java_arch: &str,
+    minecraft_updated: bool,
+) -> Option<String> {
+    let mut parts = BTreeSet::new();
+    for library in libraries {
+        if let Some(rules) = &library.rules
+            && !parse_rules(
+                rules,
+                java_arch,
+                &QuickPlayType::None,
+                minecraft_updated,
+            )
+        {
+            continue;
+        }
+        let Ok(Some((_, sha1, _))) = library.native_download(java_arch)
+        else {
+            continue;
+        };
+        parts.insert(format!(
+            "{}:{}",
+            library.name,
+            sha1.map(|it| it.to_string()).unwrap_or_default()
+        ));
+    }
+    (!parts.is_empty()).then(|| {
+        let joined = parts.into_iter().collect::<Vec<_>>().join("\n");
+        sha1_smol::Sha1::from(joined.as_bytes()).hexdigest()
+    })
+}
+
 /// Installed instances can outlive files in the shared runtime cache. Include
 /// processor-generated libraries so recovery also reruns the loader installer.
 pub(super) fn missing_runtime_file(
@@ -262,6 +304,18 @@ pub(super) fn missing_runtime_file(
             .join(d::util::get_path_from_artifact(&library.name)?);
         if !path.try_exists()? {
             return Ok(Some(path));
+        }
+    }
+
+    if let Some(expected) = expected_native_fingerprint(
+        &version.libraries,
+        java_arch,
+        minecraft_updated,
+    ) {
+        let fingerprint_path = native_fingerprint_path(st, &version.id);
+        let current = std::fs::read_to_string(&fingerprint_path).ok();
+        if current.as_deref() != Some(expected.as_str()) {
+            return Ok(Some(fingerprint_path));
         }
     }
 
@@ -554,7 +608,17 @@ pub async fn download_version_info(
     }
 
     let removed_loader = loader.is_some_and(super::is_locally_installed_loader);
-    let res = if path.exists() && (!force.unwrap_or(false) || removed_loader) {
+
+    let cached_vanilla_info_is_stale = loader.is_none()
+        && path.exists()
+        && sha1_file_async(&path)
+            .await
+            .is_ok_and(|(_, hash)| hash != version.sha1.to_string());
+
+    let res = if path.exists()
+        && (!force.unwrap_or(false) || removed_loader)
+        && !cached_vanilla_info_is_stale
+    {
         io::read(&path)
             .err_into::<crate::Error>()
             .await
@@ -581,10 +645,11 @@ pub async fn download_version_info(
                 )
                 .await?;
         }
+        let expected_sha1 = version.sha1.to_string();
         let mut info: GameVersionInfo = fetch_json(
             Method::GET,
             version.url.as_str(),
-            None,
+            Some(&expected_sha1),
             None,
             None,
             &st.api_semaphore,
@@ -1049,6 +1114,18 @@ pub async fn download_libraries(
         },
     )
     .await?;
+
+    if let Some(fingerprint) =
+        expected_native_fingerprint(libraries, java_arch, minecraft_updated)
+    {
+        write(
+            &native_fingerprint_path(st, version),
+            fingerprint.as_bytes(),
+            &st.io_semaphore,
+        )
+        .await
+        .context("writing native library fingerprint")?;
+    }
 
     tracing::debug!("Done loading libraries!");
     Ok(())
